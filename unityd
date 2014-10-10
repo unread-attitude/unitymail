@@ -1,0 +1,893 @@
+#!/usr/bin/perl
+use Socket;
+use strict;
+use Fcntl ':flock';
+use POSIX 'setsid';
+use POSIX ':sys_wait_h';
+use Digest::MD5 qw(md5_base64);
+use MIME::Base64;
+use Net::DNS;
+use Time::HiRes;
+use logmsg;
+use whois;
+my $dns = Net::DNS::Resolver->new;
+my $EOL = "\015\012";
+our $naddr;
+our $cmd = '';
+our $cd = '';
+our $dID = "$$";
+our $lastcmd = '';
+our $country = '';
+our $locpart = '';
+our ($HELO, $FROM, $RCPT, $DATA, $OUTBOUND);
+our @mx;
+our @wID;
+our %kids;
+our $waitedpid = 0;
+
+my $cachedir = "/home/jmitchel/whois.cache";
+my %sleepCache;
+our $cachefile = '';
+$| = 1;
+
+
+sub SigLord {
+	my ($sig) = @_;
+	if ($sig =~ /(?:CHLD|NUM|USR)/) {
+		logmsg("Caught SIG$sig.  Ignoring");
+		return;
+	} else {
+		logmsg("Caught SIG$sig.  Exiting");
+		exit 0;
+	}
+}
+
+sub REAPER {
+	while (($waitedpid = waitpid(-1, WNOHANG)) > 0) {
+		if (exists($kids{$waitedpid})) {
+			delete($kids{$waitedpid});
+		} else {
+			print "$$:SIGCHLD from nonchild $waitedpid\n";
+		}
+	}
+	$SIG{'CHLD'} = \&REAPER;
+}
+
+
+my $paddr;
+
+socket(Server, PF_INET, SOCK_STREAM, getprotobyname('tcp')) || die "socket: $!";
+setsockopt(Server, SOL_SOCKET, SO_REUSEADDR, pack("l", 1)) || die "setsockopt: $!";
+bind(Server, sockaddr_in(25, INADDR_ANY)) || die "bind: $!";
+listen(Server, SOMAXCONN) || die "listen: $!";
+
+
+chdir '/';
+defined(my $pid = fork) || die "cannot fork $0: $!";
+if ($pid) {
+	print "$0 started.  PID == $pid\n";
+	exit 0;
+}
+
+#print "Tying signals to SigLord: ";
+foreach my $sig (keys %SIG) {
+	next if $sig =~ /\_\_/; # Internal perl signal.  Ignore
+#	print "SIG$sig, ";
+	$SIG{$sig} = \&SigLord;
+}
+#print "\n";
+#
+my %sWords;
+open SC, "/home/jmitchel/unity/scores";
+while (<SC>) {
+	chomp;
+	my ($w, $s) = split(/\s+/, $_,2);
+	$sWords{$w} = $s;
+}
+close SC;
+
+
+$SIG{'CHLD'} = \&REAPER;
+
+setsid || die "can't start new session: $!";
+open STDIN, '/dev/null' || die "cannot read /dev/null: $!";
+open STDOUT, '>>/var/log/unity.log' || die "cannot write to unity.log: $!";
+open STDERR, '>&STDOUT' || die "cannot dup stdout: $!";
+$| = 1;
+$dID = "$$";
+
+
+logmsg("program started");
+
+my $paddr;
+
+
+while(1) {
+	eval {
+		$paddr = accept(Client, Server);
+	};
+	if (!defined($paddr)|| !$paddr) {
+		logmsg((scalar(keys(%kids)))." kids pending");
+		logmsg("accept: $@") if ($@);
+		next;
+	}
+		
+	if (scalar(keys(%kids)) > 10) {
+		syswrite(Client, "421 Service too busy.  Try again later.$EOL");
+		close(Client);
+		next;
+	}
+
+	syswrite(Client, "220 mail.jmitchel.com SMTP service$EOL");
+
+	my $pid = fork();
+	if (!defined($pid)) {
+		logmsg("Fork failed");
+	} elsif ($pid != 0) {
+		$kids{$pid} = time();
+		$SIG{'CHLD'} = \&REAPER;
+	} else {
+		$SIG{'CHLD'} = 'IGNORE';
+	}
+
+	if (!defined($pid) || $pid) {
+		close Client;
+		$naddr = undef;
+		next;
+	}
+
+	my($port,$iaddr) = sockaddr_in($paddr);
+	$naddr = inet_ntoa($iaddr);
+
+	close(Server);
+	my $oID = $dID;
+	$dID = "$dID|$$ \[$naddr:$port\]";
+
+	my %spamHELO;
+	my $msgScore = 100;
+	my $okCountry = 1;
+	my %vNETS;
+	my %bNETS;
+	my %whitesndr;
+	my $name = gethostbyaddr($iaddr,AF_INET) || $naddr;
+	logmsg("connection by $name");
+
+	$SIG{'CHLD'} = sub {
+		my $waitedpid = wait;
+		@wID = doWHOIS($naddr);
+		$country = getCountry($naddr);
+		my $state = getState($naddr);
+		my $city = getCity($naddr);
+		$locpart = $country;
+		if ($country eq 'US' && $state ne 'UNKNOWN' && $city ne 'UNKNOWN') {
+			$locpart = "$city,$state";
+		} else {
+			$locpart = "$state $locpart" if $state ne 'UNKNOWN';
+			$locpart = "$city, $locpart" if $city ne 'UNKNOWN';
+		}
+		$SIG{'CHLD'} = 'IGNORE';
+		logmsg("client location $locpart");
+	};
+	my $pid = fork();
+	if (!defined($pid)) {
+		logmsg("Fork of whois process failed");
+		$SIG{'CHLD'} = 'IGNORE';
+	} elsif (!$pid) {
+		close Client;
+		$dID = "$oID|$$ [whois]";
+		#Prime Cache
+		alarm 60;
+		doWHOIS($naddr);
+		exit 0;
+	}
+
+	alarm(300);
+	$SIG{'ALRM'} = sub { logmsg("Timeout.  Goodbye."); exit; };
+	$SIG{'PIPE'} = sub { logmsg("Client disconnected."); };
+		
+	open LIST, "/home/jmitchel/unity/whitesndr";
+	while(<LIST>) { chomp; $whitesndr{$_} = 1; };
+	close LIST;
+
+
+	my %RCPTS;
+	my ($ESMTP, $SMTP) = (0, 0);
+	$SIG{HUP} = sub {logmsg "cmd: \"$cmd\" | DATA: \"$DATA\""};
+	my ($cmdbuf, $authUname) = ('', '');
+	my $cmdState = '';
+
+	MSGLOOP: while(1) {
+		my $closeUp = 0;
+		my ($status, $statusMSG) = (250, 'OK');
+
+		$cmd = undef;
+		while(!defined($cmd) && length($cmdbuf) < 8192) {
+			my $b;
+			my $ct = sysread(Client, $b, 1024);
+			if (!defined($ct)) {
+				logmsg("sysread had a glitch");
+			} elsif ($ct > 0) {
+				$cmdbuf .=  $b;
+				my $idx = index($cmdbuf, $EOL);
+				if ($idx >= 0) {
+					$cmd = substr($cmdbuf, 0, $idx+length($EOL), '');
+					last;
+				}
+			} elsif ($ct == 0) {
+				logmsg("sysread failed");
+				last MSGLOOP;
+			} else {
+				logmsg("sysread == $ct");
+				last MSGLOOP;
+			}
+		}
+		if (!defined($cmd)) {
+			logmsg("Invalid msgformat:\n$cmdbuf\n-----------------------------------------");
+			$cmdbuf = '';
+			next;
+		}
+		$cmd =~ tr/A-Za-z0-9\ \.\,\"\'\<\>\:\-\_\@/ /c;
+		$cmd =~ s/^\s+//g;
+		$cmd =~ s/\s+$//g;
+		$cd = $cmd;
+
+		if ($cmdState eq 'AUTH:LOGIN:USERNAME') {
+			$authUname = decode_base64($cmd);
+			$cmdState = 'AUTH:LOGIN:PASSWORD';
+			($status, $statusMSG) = (334, 'UGFzc3dvcmQ6');
+		} elsif ($cmdState eq 'AUTH:LOGIN:PASSWORD') {
+			$cmdState = '';
+			my $pass = decode_base64($cmd);
+			if ($authUname eq 'jmitchel' && $pass eq 'mailmajik') {
+				$msgScore = 10000;
+				$OUTBOUND = 1;
+				logmsg("$authUname logged in");
+				($status, $statusMSG) = (235, "$authUname logged in");
+				$status = 235;
+				alarm 600;
+			} else {
+				logmsg("$authUname flubbed attempt with $1");
+				($status, $statusMSG) = (501, 'authenication rejected');
+			}
+		} elsif ($cmdState ne '') {
+			logmsg("undefined cmdstate $cmdState");
+		} elsif ($cmd =~ /^(HELO|EHLO)\s+(.*)$/i) {
+			$HELO = $2;
+
+			if (lc($1) eq "ehlo" ) {
+				$msgScore += 10;
+				$ESMTP = 1;
+				logmsg("client sortof implement ESMTP");
+				syswrite(Client, join('-', 250, "HELP").$EOL);
+				$statusMSG = "AUTH LOGIN PLAIN";
+			} else {
+				$statusMSG = 'mail.jmitchel.com';
+			}
+
+			if ($name =~ /$HELO/i || $naddr eq $HELO) {
+				logmsg("HELO matches $name");
+			} else {
+				my $HELLOiaddr = inet_aton($HELO);
+				if (!defined($HELLOiaddr)) {
+					logmsg("connection: nonresolving HELO \[ $name \]");
+					$msgScore -= 10;
+				} else {
+					my $HELOaddr = inet_ntoa($HELLOiaddr);
+					if ($HELOaddr eq $naddr) {
+						1; #NOOP
+						#logmsg("connection: matching IP address");
+					} elsif ($name =~ /$HELO/ || $naddr eq $HELO) {
+						1; #NOOP
+						#logmsg("connection: matching HELO address");
+					} else {
+						logmsg("misconnection from $name") if $msgScore > 80;
+						$msgScore -= 5;
+					}
+				}
+			}
+		} elsif ($ESMTP == 1 && $cmd =~ /^AUTH\s+(\S+)(?:\s+(\S+))?/i) {
+			if (uc($1) eq "PLAIN" && defined($2)) {
+				my ($aid, $pass) = (undef,  '');
+				my $res = decode_base64($2);
+				($aid, $authUname, $pass) = split(/\000/, $res, 3);
+				if ($authUname eq 'jmitchel' && $pass eq 'mailmajik') {
+					$msgScore = 10000;
+					$OUTBOUND = 1;
+					logmsg("$authUname logged in");
+					($status, $statusMSG) = (235, "$authUname logged in");
+					$status = 235;
+					alarm 600;
+				} else {
+					logmsg("$authUname flubbed attempt with $1");
+					($status, $statusMSG) = (501, 'authenication rejected');
+				}
+			} elsif (uc($1) eq "LOGIN") {
+				$cmdState = 'AUTH:LOGIN:USERNAME';
+				($status, $statusMSG) = (334, "VXNlcm5hbWU6");
+			} else {
+				logmsg("bad auth type $1");
+				($status, $statusMSG) = (504, 'Unrecognized authentication type');
+			}
+		} elsif ($cmd =~ /^NOOP$/i) {
+			if ($msgScore <= 100) {
+				logmsg("NOOP called.  Why?");
+				$msgScore -= 10;
+			} else {
+				logmsg "NOOP";
+			}
+			$statusMSG = "nothing happens";
+		} elsif ($cmd =~ /^RSET$/i) {
+			if (defined($FROM) || defined($RCPT) || defined($DATA)) {
+				logmsg "RSET";
+			} else {
+				logmsg("RSET called.  Why?");
+				$msgScore -= 10;
+			}
+			$FROM = undef;
+			$RCPT = undef;
+			$DATA = undef;
+			$statusMSG = "RSET OK";
+		} elsif ($cmd =~ /^(?:POST|GET) /i ) {
+			$msgScore -= 1000;
+			$okCountry = 0;
+			logmsg("Idiot is attempting to do HTTP");
+		} elsif ($cmd =~ /^QUIT$/i) {
+			$FROM = undef;
+			$RCPT = undef;
+			$DATA = undef;
+			syswrite(Client, "221 Closing Connection$EOL");
+			last MSGLOOP;
+		} elsif ($cmd =~ /^HELP$/i) {
+			logmsg "HELP";
+			($status, $statusMSG) = (214, "HELO MAIL RCPT DATA NOOP QUIT RSET HELP");
+		} elsif ($cmd =~ /^MAIL\s+FROM:\s*(.*)$/i) {
+			#RFC 821 lets the server use codes 421, 451, 452, 500, 501, or 552
+			#to reject a MAIL request; RFC 1869 also permits code 555
+
+			if (defined($FROM)) {
+				$msgScore -= 10;
+				logmsg("$FROM replaced with $1");
+			}
+			$FROM = lc($1);
+			$FROM = $1 if ($FROM =~ /\<\s*(.+?)\s*\>/);
+
+			if (exists($whitesndr{$FROM})) {
+				$msgScore += 25;
+			}
+		} elsif ($cmd =~ /^RCPT\s+TO:\s*(.*)$/i) {
+			my $addr = lc($1);
+			if ($addr =~ /\<\s*(\S+?)\s*\>/) {
+				$addr = $1;
+			}
+			$addr =~ s/^\s*//g;
+			$addr =~ s/\s*$//g;
+
+			$RCPTS{$addr} = 1;
+
+			$RCPT = '' unless defined $RCPT;
+			$RCPT .= "$addr|";
+
+			if ($RCPT !~ /jmitchel.com/i && !$OUTBOUND) {
+				$msgScore -= 1000;
+				logmsg("Relaying requested for $addr");
+			} else {
+				open LIST, "/home/jmitchel/unity/whiteaddr";
+				while(<LIST>) {
+					chomp;
+					$msgScore += 20 if lc($_) eq $addr;
+				}
+				close LIST;
+
+				open LIST, "/home/jmitchel/unity/blackaddr";
+				while(<LIST>) {
+					chomp;
+					$msgScore -= 200 if lc($_) eq $addr;
+				}
+				close LIST;
+			}
+		} elsif ($cmd =~ /^DATA$/i) {
+			my $id = md5_base64("jmitchel.com".time());
+			my $mbox = "/var/mail/jmitchel";
+			my $open = 1;
+			my $headers = {};
+
+			if (!defined($FROM)) { $FROM = 'NONE_GIVEN'; $msgScore -= 20; }
+			if (!defined($RCPT)) { $RCPT = 'NONE_GIVEN'; $msgScore -= 20; }
+			if ($HELO !~ /\S/) { $HELO = 'NONE_GIVEN'; $msgScore -= 20; }
+
+
+			my $msgEnd = $EOL.".".$EOL;
+
+			$DATA = undef;
+			syswrite(Client, "354 Enter message, ending with "." on a line by itself$EOL");
+
+			
+			while(!defined($DATA)) {
+				my $b;
+				my $ct = sysread(Client, $b, 1024);
+				if (!defined($ct)) {
+					logmsg("sysread had a glitch");
+				} elsif ($ct > 0) {
+					$cmdbuf .=  $b;
+					my $idx = index($cmdbuf, $msgEnd);
+					if ($idx >= 0) {
+						$DATA = substr($cmdbuf, 0, $idx+length($msgEnd), '');
+						last;
+					}
+				} elsif ($ct == 0) {
+					logmsg("Dsysread failed");
+					last;
+				} else {
+					logmsg("Dsysread == $ct");
+					last;
+				}
+			}
+
+			if (!defined($DATA)) {
+				logmsg("Failed to read message in DATA");
+				last MSGLOOP;
+			}
+
+			$DATA =~ s/$EOL\.$EOL\s*$/\n/g;
+
+			if ($DATA !~ /\S/) {
+				$DATA = "-- THIS SPACE LEFT INTENTIONALLY BLANK--\n\n";
+			}
+
+
+			if ($SIG{'CHLD'} ne 'IGNORE') {
+				logmsg "whois hasn't returned yet";
+				eval {
+					select(undef,undef,undef,30);
+					if ($SIG{'CHLD'} ne 'IGNORE') {
+						logmsg "killing whois client PID $pid";
+						kill 'INT', $pid;
+						select(undef,undef,undef,10);
+					}
+				};
+				if ($@) {
+					logmsg("error killing whois client $pid: $@");
+				}
+			}
+			if ($SIG{'CHLD'} ne 'IGNORE') {
+				logmsg "failed to kill whois";
+			}
+
+
+
+			my $mxEn = {};
+
+			if ($OUTBOUND == 1) {
+				foreach my $rcpt (split(/\|\s*/, $RCPT)) {
+					if ($rcpt !~ /\@/) {
+						logmsg("RCPT $rcpt is not a real address");
+					} else {
+						my $dom = substr($rcpt, rindex($rcpt, "\@") + 1);
+						push @{$mxEn->{$dom}->{'RCPT'}}, $rcpt;
+						if (! exists $mxEn->{$dom}->{'mx'}) {
+							my @mx = mx($dom);
+							if (@mx) {
+								foreach my $rr (@mx) {
+									push @{$mxEn->{$dom}->{'mx'}}, {'preference' => $rr->preference, 'exchange' => $rr->{'exchange'}};
+								}
+								@{$mxEn->{$dom}->{'mx'}} = (@mx);
+							} else {
+								@{$mxEn->{$dom}->{'mx'}} = ({'preference' => 0, 'exchange' => $dom});
+							}
+
+						}
+					}
+				}
+				logmsg("forwarding message to domains: ".join(", ", keys(%$mxEn)));
+				foreach my $dom (keys %$mxEn) {
+					next if $dom =~ /jmitchel.com$/i;
+					my $sent = 0;
+					foreach my $mx (sort {$a->{'preference'} <=> $b->{'preference'}} @{$mxEn->{$dom}->{'mx'}}) {
+						my $a = alarm(240);
+						eval {
+							my $hostname = $mx->{'exchange'} || die "can't get exchange: $!\n";
+							local $SIG{'ALRM'} = sub {die "TIMEOUT $hostname\n"};
+							my $mxIaddr = inet_aton($hostname) || die "failed looking up $hostname: $!\n";
+							my $mxPaddr = sockaddr_in("25", $mxIaddr) || die "failed setting up paddr for $hostname:25\n";
+							socket(MX, PF_INET, SOCK_STREAM, getprotobyname('tcp')) || die "socket: $!\n";
+							connect(MX, $mxPaddr) || die "connect $hostname: $!\n";
+
+							my ($errcode, $msg) = getMXCode();
+							die "MX $hostname -- $errcode $msg\n" if $errcode != 220;
+
+							syswrite(MX, "EHLO jmitchel.com$EOL");
+							($errcode, $msg) = getMXCode();
+							if ($errcode >= 500 && $errcode < 600) {
+								syswrite(MX,"HELO jmitchel.com$EOL");
+								($errcode, $msg) = getMXCode();
+							}
+							die "MX $hostname -- $errcode $msg\n" if $errcode != 250;
+
+							syswrite(MX,"MAIL FROM: \<$FROM\>$EOL");
+							($errcode, $msg) = getMXCode();
+							die "MX $hostname -- $errcode $msg\n" if $errcode != 250;
+
+							foreach my $rcpt (@{$mxEn->{$dom}->{'RCPT'}}) {
+								syswrite(MX,"RCPT TO: \<$rcpt\>$EOL");
+								($errcode, $msg) = getMXCode();
+								die "MX $hostname -- $errcode $msg\n" if $errcode != 250;
+							}
+
+							syswrite(MX, "DATA$EOL");
+							($errcode, $msg) = getMXCode();
+							die "MX $hostname -- $errcode $msg\n" if $errcode != 354;
+
+							syswrite(MX, "$DATA$EOL\.$EOL");
+							($errcode, $msg) = getMXCode();
+							die "MX $hostname -- $errcode $msg\n" if $errcode != 250;
+
+							syswrite(MX, "QUIT$EOL");
+							close(MX);
+							$sent = 1;
+							logmsg("forwarded messages to $hostname");
+						};
+						alarm($a);
+						if ($@) {
+							my ($mm) = split(/\n/, $@);
+							logmsg($mm);
+							close(MX);
+						}
+						delete($mxEn->{$dom});
+
+						last if $sent == 1;
+					}
+					if ($sent == 0) {
+						logmsg("failed to send messages to $dom");
+						syswrite(Client, "421 - remote side failed$EOL");
+						next MSGLOOP;
+					}
+				}
+			}
+			
+			if (exists($mxEn->{'jmitchel.com'}) || $OUTBOUND != 1) {
+				$FROM =~ s/(\w|\d|\!|\@|\.)/$1/g;
+				$RCPT =~ s/\|/\, /g;
+				$RCPT =~ s/(\w|\d|\!|\@|\.)/$1/g;
+				$DATA =~ s/$EOL/\n/g;
+				my ($head, $body) = split(/\n\s*\n/, $DATA,2);
+
+				$head =~ s/\n\s+/\t/gs;
+				$head =~ tr/A-Za-z0-9\.\,\"\'\<\>\:\;\[\]\{\}\~\`\!\#\$\%\^\&\*\(\)\+\=\-\_\@ \t\n\|\\//c;
+				
+				if ($head !~ /^From /) {
+					$head = "From $FROM ".scalar(localtime())."\n".$head;
+				} else {
+					logmsg("Message has preamble.  It shouldn't");
+					$msgScore -= 5;
+				}
+		
+				my ($fromline, @remain) = split(/\n/, $head);
+				@{$headers->{'received'}} = 
+					("from $name ($HELO [".inet_ntoa($iaddr)."])\tby localhost with id $id\tfor $RCPT; ".scalar(localtime()));
+
+
+
+				foreach (@remain) {
+					my ($head, $val) = split (/\:\s*/, $_, 2);
+					push @{$headers->{lc($head)}}, $val if $val =~ /\S/;
+				}
+
+				@{$headers->{'message-id'}} = ("$id\@jmitchel.com") if !exists($headers->{'message-id'});
+				@{$headers->{'envelope-to'}} = ($RCPT);
+				@{$headers->{'envelope-from'}} = ($FROM);
+				@{$headers->{'delivery-date'}} = (scalar(localtime()));
+
+				@{$headers->{'from'}} = ($FROM) unless exists $headers->{'from'};
+				@{$headers->{'to'}} = ($RCPT) unless exists $headers->{'to'};
+				@{$headers->{'date'}} = (scalar(localtime())) unless exists $headers->{'date'};
+
+				my $frm = lc($headers->{'from'}->[0]);
+				if ($name =~ /gmail.com$/ && $RCPT =~ /gmail\@jmitchel.com/i) {
+					$msgScore += 50;
+				} elsif (rindex($frm, '@') < 1) {
+					$msgScore -= 200;
+					logmsg "Invalid from address $frm";
+				} elsif (!$OUTBOUND) {
+					$frm = $1 if $frm =~ /\<\s*(\S+?\@\S+?)\s*\>/;
+					my ($fuser, $fhost) = split(/\@/, $frm, 2);
+
+					my $answer;
+					alarm(60);
+					eval {
+						local $SIG{'ALRM'} = sub { die "whois timeout" };
+						$answer = $dns->send($fhost, 'MX');
+						if (exists($answer->{'authority'}) && scalar(@{$answer->{'authority'}}) > 0) {
+							$fhost = $answer->{'authority'}->[0]->{'name'};
+							$answer = $dns->send($fhost, 'MX') if scalar(@{$answer->{'answer'}})  < 1;
+						}
+
+					};
+					alarm(0);
+
+					if (!defined($answer) || !exists($answer->{'authority'}) ||  scalar(@{$answer->{'authority'}})  < 1) {
+						logmsg "$fhost -- domain does not resolve";
+						$msgScore -= 100;
+					} elsif (!exists($answer->{'answer'}) || scalar(@{$answer->{'answer'}}) < 0) {
+						logmsg "$fhost -- no MX defined";
+						$msgScore -= 50;
+					} else {
+						foreach my $o (@{$answer->{'answer'}}) {
+							push @mx, $o;
+						}
+						my $matches = '';
+						alarm 0;
+
+
+						if ($SIG{'CHLD'} eq 'IGNORE') {
+							alarm(60);
+							eval { 
+								local $SIG{'ALRM'} = sub { die "whois timeout" };
+								foreach my $o (sort {$a->{'preference'} <=> $b->{'preference'}} @mx) {
+									my $mxIaddr = inet_aton($o->{'exchange'});
+									if (!defined($mxIaddr)) {
+										logmsg "nonresolving MX ".$o->{'exchange'};
+										$msgScore -= 25;
+									} else {
+										foreach my $org (doWHOIS(inet_ntoa($mxIaddr))) {
+											foreach (@wID) {
+												if ($org eq $_) {
+													$matches = $o->{'exchange'}." matches " if $matches eq '';
+													$matches .= $org;
+												}
+											}
+											last if $matches ne '';
+										}
+									}
+									last if $matches ne '';
+								}
+							};
+							alarm(0);
+
+							if ($matches eq '') {
+								my $mxlist = '';
+								foreach (@mx) { $mxlist .= ($mxlist ne '' ? ', ': '').$_->{'exchange'}; };
+
+								logmsg("no match for MX(S) $mxlist");
+								$msgScore -= 30;
+							} else {
+								logmsg("org match: $matches");
+								$msgScore += 25;
+							}
+						} else {
+							logmsg("whois pid $pid has not returned");
+						}
+					}
+				}
+				alarm 300;
+
+
+				if (!exists($headers->{'subject'})) {
+					$msgScore -= 10;
+					logmsg($headers->{'from'}->[0]." -- NO SUBJECT - 0");
+					push @{$headers->{'subject'}}, "NO SUBJECT";
+				} else {
+					my $sScore = 0;
+					my $subj = lc($headers->{'subject'}->[0]);
+					my $sinfo = '';
+					#$subj =~ s/[\<\>\_\-\|]/ /gi;
+					$subj =~ tr/a-z //cd;
+					my $sCt = 0;
+					foreach my $w (split(/\s+/, $subj)) {
+						$sinfo .= $w;
+						my $wrd = substr($w, 0, 1, '');
+						$w =~ s/[aeiou\d]//gi;
+						foreach my $wo (sort {$a cmp $b} split(/ */, $w)) {
+							$wrd .= $wo if substr($wrd, -1, 1) ne $wo;
+						}
+						my $msc = '-';
+						if (exists($sWords{$wrd})) {
+							$msc = $sWords{$wrd};
+							$sScore = ($sScore*$sCt + $msc)/ ($sCt + 1);
+						}
+						$sinfo .= "\[$msc\] ";
+						$sCt++;
+					}
+					$msgScore += $sScore * 10 if $sScore < 0;
+					
+					logmsg($headers->{'from'}->[0]." -- $sinfo -- $sScore");
+				}
+
+				if ($RCPT =~ /aff\@jmitchel.com/i) {
+					$mbox = "/home/jmitchel/aff";
+				} elsif ($msgScore > 150) {
+					@{$headers->{'X-Keywords'}} = ("\$Label1");
+				} elsif ($msgScore >= 100) {
+					@{$headers->{'X-Keywords'}} = ("\$Label2");
+				} elsif ($msgScore >= 95) {
+					$mbox = "/home/jmitchel/Junk";
+					@{$headers->{'X-Priority'}} = ("3");
+					#@{$headers->{'X-Keywords'}} = ("Junk");
+				} elsif ($msgScore > 50) {
+					$mbox = "/home/jmitchel/bitbucket";
+					@{$headers->{'X-Priority'}} = ("4");
+					@{$headers->{'X-Keywords'}} = ("Junk");
+				} else {
+					$mbox = "/home/jmitchel/shit";
+					@{$headers->{'X-Priority'}} = ("5");
+					@{$headers->{'X-Keywords'}} = ("Junk");
+				}
+
+				@{$headers->{'X-MsgScore'}} = ($msgScore);
+				@{$headers->{'X-Location'}} = ($locpart);
+
+				logmsg("delivered to $mbox with $msgScore");
+
+				open MBOX, ">>$mbox";
+				flock(MBOX, LOCK_EX);
+				seek(MBOX, 0,2);
+				syswrite(MBOX, "\n\nFrom $FROM ".scalar(localtime())."\n");
+				foreach my $hh (sort keys %$headers) {
+					my @cHH;
+					foreach (split(/\-/, $hh)) {
+						push @cHH, ucfirst($_);
+					}
+					my $cHH = join('-', @cHH);
+
+					foreach my $ln (@{$headers->{$hh}}) {
+						next unless $ln =~ /\S/;
+						my $d = $ln;
+						$d =~ s/\t+/\n\t/g;
+						syswrite(MBOX, "$cHH: $d\n");
+					}
+				}
+				syswrite(MBOX, "\n$body\n\n");
+				flock(MBOX, LOCK_UN);
+				close(MBOX);
+
+				if ($msgScore >= 150) {
+					if ($SIG{'CHLD'} ne 'IGNORE') {
+						logmsg "whois hasn't returned yet";
+						eval {
+							select(undef,undef,undef,30);
+							if ($SIG{'CHLD'} ne 'IGNORE') {
+								logmsg "killing whois client PID $pid";
+								kill 'INT', $pid;
+								select(undef,undef,undef,10);
+							}
+						};
+						if ($@) {
+							logmsg("error killing whois client $pid: $@");
+						}
+					}
+					open C, ">>/home/jmitchel/unity/valid-IP";
+					print C join("\t", $naddr, $HELO, @wID)."\n";
+					close C;
+
+					open C, ">>/home/jmitchel/unity/valid-MX";
+					foreach my $rr (@mx) {
+						print C $rr->{'exchange'}."\n";
+					}
+					close C;
+				} elsif ($msgScore < 0) {
+					if ($SIG{'CHLD'} ne 'IGNORE') {
+						logmsg "whois hasn't returned yet";
+						eval {
+							select(undef,undef,undef,30);
+							if ($SIG{'CHLD'} ne 'IGNORE') {
+								logmsg "killing whois client PID $pid";
+								kill 'INT', $pid;
+								select(undef,undef,undef,10);
+							}
+						};
+						if ($@) {
+							logmsg("error killing whois client $pid: $@");
+						}
+					}
+					ejectSpammer($naddr, $HELO, \@wID, "spammer rejected: $msgScore") if $msgScore < 0;
+				}
+			}
+
+			$statusMSG = "OK ID $id";
+			last MSGLOOP if $open != 1;
+		} elsif ( $cmd =~ /^[\w\d\-]+\:\s+/ ) {
+			logmsg("probable http header \"$cmd\"") if $msgScore > 0;
+		} else {
+			logmsg("unrecognized command");
+			($status, $statusMSG) = (500, "unrecognized command");
+		}
+		syswrite(Client, join(' ', $status, $statusMSG).$EOL);
+		close(Client) if $status == 221;
+	}
+	logmsg("closed connection with $name");
+
+	if ($SIG{'CHLD'} ne 'IGNORE') {
+		logmsg "whois hasn't returned yet";
+		eval {
+			select(undef,undef,undef,30);
+			if ($SIG{'CHLD'} ne 'IGNORE') {
+				logmsg "killing whois client PID $pid";
+				kill 'INT', $pid;
+				select(undef,undef,undef,10);
+			}
+		};
+		if ($@) {
+			logmsg("error killing whois client $pid: $@");
+		}
+	}
+	ejectSpammer($naddr, $HELO, \@wID, "spammer rejected: $msgScore") if $msgScore < 0;
+	exit 0;
+}
+
+sub getDomain {
+	my ($str) = @_;
+	my $i = rindex($str, '.');
+	if ($i >0 ) {
+		my $i0 = rindex($str, '.', $i - 1);
+		if ($i0 > 0) {
+			return lc(substr($str, $i0+1));
+		} else {
+			return lc($str);
+		}
+	} else {
+		return lc($str);
+	}
+}
+
+sub ejectSpammer {
+	my ($a,$h, $whois, $m ) = @_;
+	foreach (keys %SIG) {
+		$SIG{$_} = 'IGNORE';
+	}
+	$h = '-' unless defined $h;
+	$m = "Notorious spammer $a" unless defined $m;
+
+	logmsg($m);
+	open LOG, ">>/home/jmitchel/unity/spammer-IP";
+	print LOG "$a\t$h\t".join("\t", @$whois)."\n";
+	close LOG;
+
+	open LOG, ">>/home/jmitchel/unity/spammer-MX";
+	foreach my $rr (@mx) {
+		my $mxiaddr = inet_aton($rr->{'exchange'});
+		my $mxaddr = (defined($mxiaddr) ? inet_ntoa($mxiaddr) : "-");
+		my @m;
+		if ($mxaddr ne '-') {
+			@m = doWHOIS($mxaddr) ;
+		} else {
+			@m = ('BOGUS SERVER');
+		}
+		print LOG join("\t", $mxaddr, $rr->{'exchange'}, @m)."\n" if @m;
+	}
+	close LOG;
+
+	select(undef,undef,undef,20);
+	syswrite(Client, "500 You aren't welcome here$EOL");
+	close(Client);
+	exit 0;
+}
+
+sub similarity {
+	my ($s1, $s2) = @_;
+	my $len = 3;
+	return 0 if (length($s1) < $len || length($s2) < $len);
+
+	if (length($s2) < length($s1)) {
+		my $s3 = $s1;
+		$s1 = $s2;
+		$s2 = $s3;
+	}
+
+	my %p1Tab;
+	for (my $i = 0; $i < length($s1) - ($len-1); $i++) { $p1Tab{lc(substr($s1, $i, $len))} ++}
+	my %p2Tab;
+	for (my $i = 0; $i < length($s2) - ($len-1); $i++) { $p2Tab{lc(substr($s2, $i, $len))} ++}
+
+	my ($hit, $ct) = (0, 0);
+	foreach (keys %p2Tab) {
+		$ct++;
+		if (exists $p1Tab{$_}) { $hit++; }
+	}
+	my $sim;
+	if ($ct > 0 ) {
+		$sim = int(100*$hit/$ct)/10;
+	} else {
+		$sim = 0;
+	}
+#	logmsg("$s1 / $s2 - $sim") if $sim > 3;
+	return $sim;
+}
